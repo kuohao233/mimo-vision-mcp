@@ -113,6 +113,8 @@ pip install -r requirements.txt
 
 如果你已经在当前目录创建过虚拟环境，只需要确保 `mcp` 包可用即可。
 
+**注意事项：**默认的`MIMO_BASE_URL`是token plan的url，如果你是api调用需要手动换一下url
+
 ## 环境变量
 
 ### 必填
@@ -260,6 +262,10 @@ mcp__mimo-vision__extract_text_from_image
 ### 报 `MiMo 返回空文本`
 
 上游返回格式中没有可提取的文本内容。可以尝试把 prompt 写得更具体，或检查上游模型服务是否正常。
+
+## Community
+
+This project is shared with the [LINUX DO](https://linux.do/) community.
 
 ## License
 
