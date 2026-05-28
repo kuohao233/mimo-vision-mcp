@@ -24,7 +24,7 @@
 `server.py` 使用 `mcp.server.fastmcp.FastMCP` 暴露三个 MCP 工具：
 
 1. 读取本地图片文件。
-2. 校验图片格式和大小。
+2. 校验图片格式和大小；超过 5MB 时自动缩放。
 3. 将图片编码为 Anthropic 兼容的 `image` content block。
 4. 调用 MiMo 的 Anthropic 兼容 `/v1/messages` 接口。
 5. 提取返回结果中的文本内容，交还给 Claude Code 主会话。
@@ -129,7 +129,7 @@ pip install -r requirements.txt
 | --- | --- | --- |
 | `MIMO_BASE_URL` | `https://token-plan-cn.xiaomimimo.com/anthropic` | MiMo Anthropic 兼容接口地址。 |
 | `MIMO_VISION_MODEL` | `mimo-v2.5` | 实际负责读图的视觉模型。 |
-| `MIMO_MAX_TOKENS` | `4096` | 单次返回的最大 token 数。 |
+| `MIMO_MAX_TOKENS` | `8192` | 单次返回的最大 token 数。 |
 
 仓库提供了 `.env.example` 作为配置模板：
 
@@ -229,8 +229,7 @@ mcp__mimo-vision__extract_text_from_image
 
 限制：
 
-- 单张图片最大 5MB。
-- 图片过大时需要先压缩或缩放。
+- 单张图片最大 5MB，超过时自动缩放（渐进式：缩尺寸 → 降 JPEG 质量 → 兜底砍半），统一输出 JPEG。
 - 当前服务读取的是本地文件路径，不负责下载远程图片。
 
 ## 常见问题
@@ -249,7 +248,7 @@ mcp__mimo-vision__extract_text_from_image
 
 ### 报 `图片过大`
 
-单张图片超过 5MB。请压缩、裁剪或缩放后再调用。
+图片超过 5MB 时会自动缩放到限制内（渐进式：缩尺寸 → 降 JPEG 质量 → 兜底砍半），通常不需要手动处理。如果自动缩放后 OCR 质量不满意，可以手动缩放到合适大小再调用。
 
 ### 报 `MiMo API ...`
 
@@ -261,7 +260,7 @@ mcp__mimo-vision__extract_text_from_image
 
 ### 报 `MiMo 返回空文本`
 
-上游返回格式中没有可提取的文本内容。可以尝试把 prompt 写得更具体，或检查上游模型服务是否正常。
+上游返回格式中没有可提取的文本内容。常见原因是 `max_tokens` 被模型的 thinking 阶段耗尽——服务会自动翻倍重试（8192 → 16384 → 32768 封顶），一般能自动恢复。如果仍然失败，可以尝试把 prompt 写得更具体，或检查上游模型服务是否正常。
 
 ## Community
 

@@ -16,8 +16,10 @@ API_KEY = os.environ.get("MIMO_API_KEY", "")
 if not API_KEY:
     raise RuntimeError("MIMO_API_KEY environment variable is required")
 VISION_MODEL = os.environ.get("MIMO_VISION_MODEL", "mimo-v2.5")
-MAX_TOKENS = int(os.environ.get("MIMO_MAX_TOKENS", "4096"))
+MAX_TOKENS = int(os.environ.get("MIMO_MAX_TOKENS", "8192"))
+MAX_TOKENS_CAP = 32768
 MAX_IMG_BYTES = 5 * 1024 * 1024  # Anthropic 协议单图上限
+MAX_IMG_DIMENSION = 2000  # 自动缩放时最大边长（px）
 
 MIME_BY_EXT = {
     ".png":  "image/png",
@@ -28,6 +30,39 @@ MIME_BY_EXT = {
 }
 
 mcp = FastMCP("mimo-vision")
+
+
+def _resize_to_limit(raw: bytes, mime: str) -> tuple[bytes, str]:
+    """渐进式缩放：缩尺寸 -> 降质量 -> 兜底砍半，统一输出 JPEG。"""
+    from PIL import Image
+    import io
+
+    buf = io.BytesIO(raw)
+    img = Image.open(buf)
+
+    w, h = img.size
+    if max(w, h) > MAX_IMG_DIMENSION:
+        ratio = MAX_IMG_DIMENSION / max(w, h)
+        img = img.resize((int(w * ratio), int(h * ratio)), Image.LANCZOS)
+
+    if img.mode in ("RGBA", "LA", "P"):
+        img = img.convert("RGB")
+
+    quality = 85
+    out = io.BytesIO()
+    while quality >= 50:
+        out.seek(0)
+        out.truncate()
+        img.save(out, format="JPEG", quality=quality)
+        if out.tell() <= MAX_IMG_BYTES:
+            return out.getvalue(), "image/jpeg"
+        quality -= 5
+
+    img = img.resize((img.size[0] // 2, img.size[1] // 2), Image.LANCZOS)
+    out.seek(0)
+    out.truncate()
+    img.save(out, format="JPEG", quality=60)
+    return out.getvalue(), "image/jpeg"
 
 
 def _load_image(path: str) -> dict:
@@ -44,9 +79,9 @@ def _load_image(path: str) -> dict:
 
     raw = p.read_bytes()
     if len(raw) > MAX_IMG_BYTES:
-        raise ValueError(
-            f"图片过大 ({len(raw) // 1024} KB); 上限 5MB，请先缩放"
-        )
+        original_kb = len(raw) // 1024
+        raw, mime = _resize_to_limit(raw, mime)
+        print(f"[mimo-vision] 自动缩放: {original_kb}KB -> {len(raw)//1024}KB")
 
     return {
         "type": "image",
@@ -59,40 +94,49 @@ def _load_image(path: str) -> dict:
 
 
 def _call_mimo(content_blocks: list, max_tokens: int = MAX_TOKENS) -> str:
-    """调用 MiMo 的 Anthropic 兼容端点。"""
-    payload = {
-        "model": VISION_MODEL,
-        "max_tokens": max_tokens,
-        "messages": [{"role": "user", "content": content_blocks}],
-    }
-    req = request.Request(
-        f"{BASE_URL}/v1/messages",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "x-api-key": API_KEY,
-            "anthropic-version": "2023-06-01",
-        },
-        method="POST",
-    )
-    try:
-        with request.urlopen(req, timeout=90) as resp:
-            data = json.loads(resp.read())
-    except error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"MiMo API {e.code}: {body}") from e
-    except error.URLError as e:
-        raise RuntimeError(f"网络错误: {e.reason}") from e
+    """调用 MiMo 的 Anthropic 兼容端点，max_tokens 耗尽时自动翻倍重试。"""
+    for attempt in range(3):
+        payload = {
+            "model": VISION_MODEL,
+            "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": content_blocks}],
+        }
+        req = request.Request(
+            f"{BASE_URL}/v1/messages",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": API_KEY,
+                "anthropic-version": "2023-06-01",
+            },
+            method="POST",
+        )
+        try:
+            with request.urlopen(req, timeout=90) as resp:
+                data = json.loads(resp.read())
+        except error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"MiMo API {e.code}: {body}") from e
+        except error.URLError as e:
+            raise RuntimeError(f"网络错误: {e.reason}") from e
 
-    # Anthropic 返回格式: {"content": [{"type": "text", "text": "..."}, ...]}
-    chunks = [
-        b.get("text", "")
-        for b in data.get("content", [])
-        if b.get("type") == "text"
-    ]
-    if not chunks:
+        chunks = [
+            b.get("text", "")
+            for b in data.get("content", [])
+            if b.get("type") == "text"
+        ]
+        if chunks:
+            return "".join(chunks)
+
+        if data.get("stop_reason") == "max_tokens" and max_tokens < MAX_TOKENS_CAP:
+            new_tokens = min(max_tokens * 2, MAX_TOKENS_CAP)
+            print(f"[mimo-vision] max_tokens={max_tokens} 耗尽，重试 {new_tokens}")
+            max_tokens = new_tokens
+            continue
+
         raise RuntimeError(f"MiMo 返回空文本: {data}")
-    return "".join(chunks)
+
+    raise RuntimeError(f"MiMo 返回空文本（已重试至 max_tokens={max_tokens}）: {data}")
 
 
 @mcp.tool()
